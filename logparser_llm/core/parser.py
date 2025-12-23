@@ -5,13 +5,18 @@ import time
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 import pandas as pd
-from loguru import logger
 
-from ..core.config_manager import Config
-from ..core.prefix_tree import PrefixTree
-from ..llm.client import LLMClient
-from ..storage.template_pool import TemplatePool
-from ..models.log_entry import LogEntry, ParsedLog, Template, ParsingStatistics
+from logparser_llm.config_manager import Config
+from logparser_llm.core.prefix_tree import PrefixTree
+from logparser_llm.core.merger import TemplateMerger
+from logparser_llm.llm.client import LLMClient
+from logparser_llm.storage.template_pool import TemplatePool
+from logparser_llm.storage.cache import CacheManager
+from logparser_llm.preprocessor.cleaner import LogCleaner
+from logparser_llm.models.log_entry import LogEntry, ParsedLog, Template, ParsingStatistics
+from logparser_llm.utils.logger import get_logger
+
+logger = get_logger("parser")
 
 
 class LogParserLLM:
@@ -41,11 +46,22 @@ class LogParserLLM:
         
         self.llm_client = LLMClient(config.llm)
         self.template_pool = TemplatePool()
+        self.cleaner = LogCleaner(config.preprocessing)
+        self.merger = TemplateMerger(config.merging)
+        
+        # Initialize cache
+        self.cache = CacheManager(
+            backend=config.parsing.cache_type,
+            ttl=config.parsing.cache_ttl
+        ) if config.parsing.use_cache else None
         
         # Statistics
         self.stats = ParsingStatistics()
         
         logger.info("LogParser-LLM initialized successfully")
+        logger.info(f"  LLM: {config.llm.provider}/{config.llm.model}")
+        logger.info(f"  Cache: {config.parsing.cache_type if config.parsing.use_cache else 'disabled'}")
+        logger.info(f"  Prefix tree depth: {config.prefix_tree.max_depth}")
     
     def parse(self, log: str, log_id: Optional[str] = None) -> ParsedLog:
         """
@@ -63,35 +79,55 @@ class LogParserLLM:
         if not log_id:
             log_id = f"log_{int(time.time() * 1000000)}"
         
-        log_entry = LogEntry(content=log)
+        # Preprocess log
+        original_log = log
+        cleaned_log = self.cleaner.clean(log)
+        
+        if not self.cleaner.is_valid_log(cleaned_log):
+            logger.warning(f"Invalid log: {log[:50]}...")
+            self.stats.failed += 1
+            return self._create_fallback_result(original_log, start_time)
+        
+        log_entry = LogEntry(content=cleaned_log)
         
         # Step 1: Check cache
-        cached_template_id = self.template_pool.find_template_for_log(log)
-        if cached_template_id:
-            template = self.template_pool.get_template(cached_template_id)
-            if template:
-                self.stats.cache_hits += 1
-                return self._create_parsed_log(
-                    log, template, time.time() - start_time, 
-                    used_llm=False, cache_hit=True
-                )
+        if self.cache:
+            cache_key = f"log:{log_entry.get_hash()}"
+            cached_template_id = self.cache.get(cache_key)
+            if cached_template_id:
+                template = self.template_pool.get_template(cached_template_id)
+                if template:
+                    self.stats.cache_hits += 1
+                    self.stats.total_logs += 1
+                    self.stats.successfully_parsed += 1
+                    return self._create_parsed_log(
+                        original_log, template, time.time() - start_time, 
+                        used_llm=False, cache_hit=True
+                    )
         
         # Step 2: Try prefix tree clustering
-        tree_result = self.prefix_tree.search(log)
+        tree_result = self.prefix_tree.search(cleaned_log)
         if tree_result:
             template_id, node = tree_result
             template = self.template_pool.get_template(template_id)
             if template:
-                self.template_pool.associate_log_with_template(log, template_id)
+                # Cache this result
+                if self.cache:
+                    cache_key = f"log:{log_entry.get_hash()}"
+                    self.cache.set(cache_key, template_id)
+                
+                self.template_pool.associate_log_with_template(cleaned_log, template_id)
+                self.stats.total_logs += 1
+                self.stats.successfully_parsed += 1
                 return self._create_parsed_log(
-                    log, template, time.time() - start_time,
+                    original_log, template, time.time() - start_time,
                     used_llm=False, cache_hit=False
                 )
         
         # Step 3: Use LLM for new pattern
         try:
             template_pattern = self.llm_client.extract_template(
-                log,
+                cleaned_log,
                 use_ner=self.config.parsing.enable_ner
             )
             
@@ -101,34 +137,33 @@ class LogParserLLM:
             template = Template(
                 template_id=f"tmpl_{len(self.template_pool.templates):04d}",
                 template_pattern=template_pattern,
-                example_logs=[log],
+                example_logs=[original_log],
                 confidence=0.9
             )
             
             # Add to pool and tree
             template_id = self.template_pool.add_template(template)
-            self.prefix_tree.insert(log, log_id)
-            self.template_pool.associate_log_with_template(log, template_id)
+            self.prefix_tree.insert(cleaned_log, log_id)
+            self.template_pool.associate_log_with_template(cleaned_log, template_id)
+            
+            # Cache this result
+            if self.cache:
+                cache_key = f"log:{log_entry.get_hash()}"
+                self.cache.set(cache_key, template_id)
             
             self.stats.successfully_parsed += 1
+            self.stats.total_logs += 1
             
             return self._create_parsed_log(
-                log, template, time.time() - start_time,
+                original_log, template, time.time() - start_time,
                 used_llm=True, cache_hit=False
             )
             
         except Exception as e:
             logger.error(f"Failed to parse log: {e}")
             self.stats.failed += 1
-            
-            # Return fallback result
-            return ParsedLog(
-                original=log,
-                template_id="unknown",
-                template_pattern=log,
-                confidence=0.0,
-                processing_time_ms=(time.time() - start_time) * 1000
-            )
+            self.stats.total_logs += 1
+            return self._create_fallback_result(original_log, start_time)
     
     def parse_batch(
         self,
@@ -153,15 +188,22 @@ class LogParserLLM:
         
         # Step 1: Check cache for all logs
         for i, log in enumerate(logs):
-            cached_template_id = self.template_pool.find_template_for_log(log)
-            if cached_template_id:
-                template = self.template_pool.get_template(cached_template_id)
-                if template:
-                    results.append(self._create_parsed_log(
-                        log, template, 0, used_llm=False, cache_hit=True
-                    ))
-                    self.stats.cache_hits += 1
-                    continue
+            # Try cache first
+            if self.cache:
+                cleaned = self.cleaner.clean(log)
+                cache_key = f"log:{LogEntry(content=cleaned).get_hash()}"
+                cached_template_id = self.cache.get(cache_key)
+                
+                if cached_template_id:
+                    template = self.template_pool.get_template(cached_template_id)
+                    if template:
+                        results.append(self._create_parsed_log(
+                            log, template, 0, used_llm=False, cache_hit=True
+                        ))
+                        self.stats.cache_hits += 1
+                        self.stats.total_logs += 1
+                        self.stats.successfully_parsed += 1
+                        continue
             
             # Not in cache
             uncached_logs.append(log)
@@ -170,7 +212,9 @@ class LogParserLLM:
         
         # Step 2: Process uncached logs
         if uncached_logs:
-            if self.config.parsing.enable_batch_processing and len(uncached_logs) > 1:
+            logger.info(f"Processing {len(uncached_logs)} uncached logs")
+            
+            if self.config.parsing.enable_batch_processing and len(uncached_logs) > 3:
                 # Batch LLM processing
                 parsed_logs = self._parse_batch_with_llm(uncached_logs)
             else:
@@ -181,10 +225,14 @@ class LogParserLLM:
             for idx, parsed_log in zip(uncached_indices, parsed_logs):
                 results[idx] = parsed_log
         
-        self.stats.total_logs += len(logs)
+        # Auto-merge templates periodically
+        if self.config.merging.enable_auto_merge:
+            if len(self.template_pool.templates) > 100:
+                logger.info("Running template auto-merge...")
+                self._auto_merge_templates()
         
         logger.info(
-            f"Batch parsing complete: {self.stats.cache_hits} cache hits, "
+            f"Batch complete: {self.stats.cache_hits} cache hits, "
             f"{self.stats.llm_calls} LLM calls"
         )
         
@@ -194,7 +242,8 @@ class LogParserLLM:
         self,
         file_path: str,
         log_column: str = "log",
-        output_path: Optional[str] = None
+        output_path: Optional[str] = None,
+        chunk_size: int = 1000
     ) -> pd.DataFrame:
         """
         Parse logs from a file.
@@ -203,6 +252,7 @@ class LogParserLLM:
             file_path: Input file path (CSV, JSON, or text)
             log_column: Column name for logs (CSV/JSON)
             output_path: Optional output path for results
+            chunk_size: Process logs in chunks
             
         Returns:
             DataFrame with parsing results
@@ -223,12 +273,17 @@ class LogParserLLM:
                 logs = [line.strip() for line in f if line.strip()]
             df = pd.DataFrame({'log': logs})
         
-        # Parse logs
-        parsed_logs = self.parse_batch(logs)
+        # Parse logs in chunks
+        all_results = []
+        for i in range(0, len(logs), chunk_size):
+            chunk = logs[i:i+chunk_size]
+            logger.info(f"Processing chunk {i//chunk_size + 1}/{(len(logs)-1)//chunk_size + 1}")
+            parsed_chunk = self.parse_batch(chunk)
+            all_results.extend(parsed_chunk)
         
         # Create output DataFrame
         results = []
-        for parsed in parsed_logs:
+        for parsed in all_results:
             results.append({
                 'original': parsed.original,
                 'template_id': parsed.template_id,
@@ -251,7 +306,10 @@ class LogParserLLM:
     def _parse_batch_with_llm(self, logs: List[str]) -> List[ParsedLog]:
         """Parse multiple logs using batch LLM call."""
         try:
-            templates = self.llm_client.extract_template_batch(logs)
+            # Clean logs first
+            cleaned_logs = [self.cleaner.clean(log) for log in logs]
+            
+            templates = self.llm_client.extract_template_batch(cleaned_logs)
             self.stats.llm_calls += 1
             
             results = []
@@ -265,12 +323,21 @@ class LogParserLLM:
                 )
                 
                 template_id = self.template_pool.add_template(template)
-                self.template_pool.associate_log_with_template(log, template_id)
+                cleaned = self.cleaner.clean(log)
+                self.template_pool.associate_log_with_template(cleaned, template_id)
+                
+                # Cache
+                if self.cache:
+                    cache_key = f"log:{LogEntry(content=cleaned).get_hash()}"
+                    self.cache.set(cache_key, template_id)
                 
                 parsed = self._create_parsed_log(
                     log, template, 0, used_llm=True, cache_hit=False
                 )
                 results.append(parsed)
+                
+                self.stats.successfully_parsed += 1
+                self.stats.total_logs += 1
             
             return results
             
@@ -278,6 +345,18 @@ class LogParserLLM:
             logger.error(f"Batch LLM processing failed: {e}")
             # Fallback to individual processing
             return [self.parse(log) for log in logs]
+    
+    def _auto_merge_templates(self):
+        """Automatically merge similar templates."""
+        templates = self.template_pool.get_all_templates()
+        merged = self.merger.merge_batch(templates)
+        
+        if len(merged) < len(templates):
+            logger.info(f"Merged {len(templates)} templates into {len(merged)}")
+            # Update pool (simplified - in production would need careful handling)
+            self.template_pool.clear()
+            for t in merged:
+                self.template_pool.add_template(t)
     
     def _create_parsed_log(
         self,
@@ -291,15 +370,31 @@ class LogParserLLM:
         # Extract variables (simplified)
         variables = self._extract_variables(log, template.template_pattern)
         
+        # Extract timestamp and level
+        timestamp_str, level, _ = self.cleaner.split_log_components(log)
+        
         return ParsedLog(
             original=log,
             template_id=template.template_id,
             template_pattern=template.template_pattern,
             variables=variables,
+            log_level=level,
             confidence=template.confidence,
             processing_time_ms=processing_time * 1000,
             used_llm=used_llm,
             cache_hit=cache_hit
+        )
+    
+    def _create_fallback_result(self, log: str, start_time: float) -> ParsedLog:
+        """Create fallback result for failed parsing."""
+        return ParsedLog(
+            original=log,
+            template_id="unknown",
+            template_pattern=log,
+            confidence=0.0,
+            processing_time_ms=(time.time() - start_time) * 1000,
+            used_llm=False,
+            cache_hit=False
         )
     
     @staticmethod
@@ -322,20 +417,20 @@ class LogParserLLM:
     
     def get_statistics(self) -> Dict:
         """Get comprehensive parsing statistics."""
-        return {
-            **self.stats.to_dict(),
-            "prefix_tree_stats": self.prefix_tree.get_statistics(),
-            "template_pool_stats": self.template_pool.get_statistics(),
-            "llm_stats": self.llm_client.get_statistics()
-        }
+        stats = self.stats.to_dict()
+        stats.update({
+            'prefix_tree': self.prefix_tree.get_statistics(),
+            'template_pool': self.template_pool.get_statistics(),
+            'llm': self.llm_client.get_statistics()
+        })
+        
+        if self.cache:
+            stats['cache'] = self.cache.get_statistics()
+        
+        return stats
     
     def save_state(self, directory: str):
-        """
-        Save parser state (templates, statistics).
-        
-        Args:
-            directory: Output directory
-        """
+        """Save parser state."""
         dir_path = Path(directory)
         dir_path.mkdir(parents=True, exist_ok=True)
         
@@ -350,53 +445,12 @@ class LogParserLLM:
         logger.info(f"Parser state saved to: {directory}")
     
     def load_state(self, directory: str):
-        """
-        Load parser state.
-        
-        Args:
-            directory: Directory containing saved state
-        """
+        """Load parser state."""
         dir_path = Path(directory)
         
-        # Load templates
         template_file = dir_path / "templates.json"
         if template_file.exists():
             self.template_pool.load_from_file(str(template_file))
             logger.info(f"Loaded {len(self.template_pool.templates)} templates")
-
-
-# Example usage
-if __name__ == "__main__":
-    from ..core.config_manager import Config, LLMConfig, ParsingConfig, \
-        PrefixTreeConfig, MergingConfig, PerformanceConfig
-    
-    # Create config
-    config = Config(
-        llm=LLMConfig(api_key="your-key", model="gpt-3.5-turbo"),
-        parsing=ParsingConfig(),
-        prefix_tree=PrefixTreeConfig(),
-        merging=MergingConfig(),
-        performance=PerformanceConfig()
-    )
-    
-    # Initialize parser
-    parser = LogParserLLM(config)
-    
-    # Parse some logs
-    logs = [
-        "2024-01-01 10:00:00 ERROR Failed to connect to database",
-        "2024-01-01 10:05:00 ERROR Failed to connect to server",
-        "2024-01-01 10:10:00 INFO User john logged in"
-    ]
-    
-    results = parser.parse_batch(logs)
-    
-    for result in results:
-        print(f"Template: {result.template_pattern}")
-        print(f"Used LLM: {result.used_llm}")
-        print(f"Cache hit: {result.cache_hit}")
-        print()
-    
-    # Print statistics
-    print("Statistics:")
-    print(parser.get_statistics())
+        else:
+            logger.warning(f"No template file found at {template_file}")
