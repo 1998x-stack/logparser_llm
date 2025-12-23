@@ -1,0 +1,102 @@
+# LogParser-LLM Configuration File
+
+# LLM Provider Configuration
+llm:
+  provider: "openai"  # Options: openai, azure, local
+  model: "gpt-4-turbo-preview"  # or gpt-3.5-turbo for cost savings
+  api_key: "${OPENAI_API_KEY}"  # Read from environment variable
+  api_base: null  # Optional: for Azure or local deployments
+  temperature: 0.0  # Lower for more deterministic outputs
+  max_tokens: 500
+  timeout: 30  # seconds
+  max_retries: 3
+  retry_delay: 1.0  # seconds
+
+# Azure OpenAI (if provider is azure)
+azure:
+  api_version: "2024-02-15-preview"
+  deployment_name: "gpt-4"
+
+# Parsing Configuration
+parsing:
+  # Cache settings
+  use_cache: true
+  cache_type: "memory"  # Options: memory, redis, file
+  cache_ttl: 86400  # seconds (24 hours)
+  
+  # Batch processing
+  batch_size: 20
+  enable_batch_processing: true
+  
+  # Template matching
+  similarity_threshold: 0.85
+  min_confidence: 0.7
+  
+  # LLM optimization
+  enable_llm_cache: true
+  max_llm_calls_per_batch: 100
+  
+  # Granularity control
+  use_icl: false  # In-Context Learning
+  icl_shots: 5
+  enable_ner: true  # Named Entity Recognition in prompts
+
+# Prefix Tree Configuration
+prefix_tree:
+  max_depth: 5
+  min_cluster_size: 3
+  token_delimiter: " "
+  enable_fuzzy_matching: true
+  fuzzy_threshold: 0.8
+
+# Template Merging
+merging:
+  enable_auto_merge: true
+  merge_threshold: 0.9
+  max_edit_distance: 3
+  check_semantic_similarity: true
+
+# Preprocessing
+preprocessing:
+  remove_timestamps: false
+  remove_ip_addresses: false
+  normalize_numbers: true
+  normalize_paths: true
+  custom_patterns: []
+
+# Performance & Resources
+performance:
+  max_workers: 4
+  enable_async: true
+  memory_limit_mb: 2048
+  queue_size: 1000
+
+# Monitoring & Logging
+monitoring:
+  enable_metrics: true
+  metrics_port: 9090
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_file: "logs/logparser.log"
+  log_rotation: "100 MB"
+  
+# Storage
+storage:
+  templates_file: "data/templates.json"
+  cache_directory: "cache/"
+  enable_persistence: true
+  auto_save_interval: 300  # seconds
+
+# API Configuration
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  enable_cors: true
+  rate_limit: 100  # requests per minute
+
+# Cost Control
+cost:
+  max_api_cost_per_day: 100.0  # USD
+  enable_cost_tracking: true
+  prefer_cheap_model_for_simple: true
+  simple_log_threshold: 50  # characters
